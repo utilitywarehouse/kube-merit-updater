@@ -1,0 +1,214 @@
+#!/bin/bash
+
+# Shell style guide: https://google.github.io/styleguide/shell.xml
+
+# ## (-)  master and worker steps
+# ## (*)  worker specific steps
+# ## (**) storage-node specific steps
+#
+# Assumes a kubernetes cluster with master and workers nodes and separate
+# storage-nodes to schedule pvc related pods.
+#
+# - drain nodes (sequentially)
+# - reboot nodes and wait until they are back and in `Ready` state
+# ** For storage nodes we need to verify that all volumes have enough replicas
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+readonly retire_time=$(date +"%Y-%m-%dT%H-%M-%SZ")
+
+# flags
+kube_context=''
+role=''
+resume=''
+timeout=600
+
+usage() {
+  cat <<EOF
+Usage: $0 -c <kube_context> -s [retire_time_label] -r [role]
+        -t [timeout]
+
+  -s    Resume node rolling. Argument is retire_time label. If set, -r [role]
+        must also be set
+  -t    Node drain timeout. How long to wait for the node to drain before
+        shutting it down (in seconds, default 300s)
+EOF
+}
+
+while getopts 'c:r:h:s:t:' flag; do
+  case "${flag}" in
+    c) kube_context="${OPTARG}" ;;
+    r) role="${OPTARG}" ;;
+    s) resume="${OPTARG}" ;;
+    t) timeout="${OPTARG}" ;;
+    h) usage && exit 0 ;;
+    *) echo "Unexpected option: ${flag}" && usage && exit 1 ;;
+  esac
+done
+
+### Deps
+deps="
+  awk
+  jq
+  kubectl
+  ssh
+  timeout
+  xargs
+"
+
+missing_deps=""
+for d in ${deps}; do
+  if ! command -v ${d} &> /dev/null; then
+    missing_deps+="${d} "
+  fi
+done
+
+if [[ -n "${missing_deps}" ]]; then
+  echo "Missing dependencies: ${missing_deps}"
+  exit 1
+fi
+
+### Validation
+if [[ -z "${kube_context}" ]]; then
+  usage
+  exit 1
+fi
+
+if [[ -z "${role}" ]] ; then
+  echo "A role should always be provided"
+  usage
+  exit 1
+fi
+
+function fail() {
+  echo $1 >&2
+  exit 1
+}
+
+function retry() {
+  local n=1
+  local max=12
+  local delay=8
+  while true; do
+    "$@" && break || {
+      if [[ $n -lt $max ]]; then
+        ((n++))
+        echo "command failed: attempt=$n max=$max"
+        sleep $delay;
+      else
+        fail "the command has failed after $n attempts."
+      fi
+    }
+  done
+}
+
+label_for_cycling() {
+  local role=$1
+  local nodes=""
+  while [[ -z "${nodes}" ]]; do
+    nodes=$(retry kubectl --context=${kube_context} get nodes -l role=${role} -o json | jq -r '.items[].metadata.name')
+  done
+
+  echo "${kube_context}: nodes=$(echo "${nodes}" | wc -l) role=${role}"
+  echo "labelling for retirement: role=${role}"
+  for node in ${nodes}; do
+    retry kubectl --context=${kube_context} label node ${node} retiring=${retire_time} --overwrite=true
+  done
+}
+
+delete_pods() {
+  local node=$1
+
+  retry kubectl --context=${kube_context} get pod --all-namespaces \
+    -o jsonpath='{range .items[?(.spec.nodeName=="'${node}'")]}{@.metadata.namespace} {.metadata.name} {end}' |\
+    xargs -n2 |\
+    xargs -I % sh -c "kubectl --context=${kube_context} delete pods -n=%"
+}
+
+drain_node() {
+  local node=$1
+
+  set +e
+  time timeout ${timeout} kubectl --context=${kube_context} drain ${node} --ignore-daemonsets --force --delete-local-data
+  local rc=$?
+  if [[ ${rc} -eq 0 ]]; then
+    echo "drained successfully"
+  elif [[ ${rc} -eq 124 ]]; then
+    echo "timeout reached, continuing: timeout=${timeout}"
+    delete_pods ${node}
+  else
+    echo "kubectl drain exit error: ${rc}"
+    delete_pods ${node}
+  fi
+}
+
+reboot_node() {
+  local node=$1
+
+  ssh -o ServerAliveInterval=1 -o ServerAliveCountMax=1 -o BatchMode=yes ${node} sudo reboot
+
+  set +e
+  local kube_active=$(ssh -oBatchMode=yes ${node} systemctl is-active kubelet.service)
+  until [[ ${kube_active} == "active" ]]; do
+    echo "awaiting node: ${node} to reboot and kubelet.service to become active"
+    sleep 15
+    kube_active=$(ssh -oBatchMode=yes ${node} systemctl is-active kubelet.service)
+  done
+}
+
+wait_for_ready_node() {
+  local node=$1
+
+  set +e
+  # Wait for node to report ready again
+  local node_status=$(kubectl --context=${kube_context} get node | grep ${node} | awk '{print $2}')
+  until [[ ${node_status} == "Ready,SchedulingDisabled" ]]; do
+    echo "awaiting node: ${node} to become Ready"
+    sleep 10
+    node_status=$(kubectl --context=${kube_context} get node | grep ${node} | awk '{print $2}')
+  done
+  # Uncordon the node
+  retry kubectl --context=${kube_context} uncordon ${node}
+}
+
+cycle_nodes() {
+  local role=$1
+
+  # - drain and reboot nodes (sequentially)
+  local nodes=$(retry kubectl --context="${kube_context}" get nodes -l role="${role}",retiring="${retire_time}" -o json |\
+    jq -r '.items[].metadata.name')
+  for node in ${nodes}; do
+    drain_node ${node}
+    reboot_node ${node}
+    wait_for_ready_node ${node}
+  done
+
+}
+
+update() {
+  local role=$1
+  label_for_cycling ${role}
+  cycle_nodes ${role}
+}
+
+resume() {
+  local target_nodes=$(retry kubectl --context="${kube_context}" get nodes -l role="${role}",retiring="${resume}" -o json |\
+    jq -r '.items[].metadata.name')
+  for target_node in ${target_nodes}; do
+    drain_node ${target_node}
+  done
+
+}
+
+echo "kube cluster: ${kube_context}"
+
+if [[ -n "${resume}" ]]; then
+  resume
+  exit 0
+fi
+
+update ${role}
+
+echo "run: result=\"success\""
