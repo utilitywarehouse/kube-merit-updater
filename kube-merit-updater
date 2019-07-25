@@ -25,6 +25,11 @@ role=''
 resume=''
 timeout=600
 
+# Static vars
+storage_ns='sys-longhorn'
+pvc_label_key='type'
+pvc_label_val='storage'
+
 usage() {
   cat <<EOF
 Usage: $0 -c <kube_context> -s [retire_time_label] -r [role]
@@ -118,10 +123,21 @@ label_for_cycling() {
   done
 }
 
+label_storage_pods() {
+
+  local storage_pods=$(retry kubectl --context=${kube_context} --namespace=${storage_ns} get po | grep pvc | grep -v backup | awk '{print $1}' )
+
+  for pod in ${storage_pods}; do
+    echo "Labeling pod: ${pod} as ${pvc_label_key}=${pvc_label_val}"
+    retry kubectl --context=${kube_context} --namespace=${storage_ns} label pod ${pod} ${pvc_label_key}=${pvc_label_val} --overwrite
+  done
+  echo "pods labelled"
+}
+
 delete_pods() {
   local node=$1
 
-  retry kubectl --context=${kube_context} get pod --all-namespaces \
+  retry kubectl --context=${kube_context} get pod --all-namespaces --selector="${pvc_label_key}!=${pvc_label_val}" \
     -o jsonpath='{range .items[?(.spec.nodeName=="'${node}'")]}{@.metadata.namespace} {.metadata.name} {end}' |\
     xargs -n2 |\
     xargs -I % sh -c "kubectl --context=${kube_context} delete pods -n=%"
@@ -130,8 +146,10 @@ delete_pods() {
 drain_node() {
   local node=$1
 
+  label_storage_pods # Label storage pods right before draining to catch any new storage pod creation
+
   set +e
-  time timeout ${timeout} kubectl --context=${kube_context} drain ${node} --ignore-daemonsets --force --delete-local-data
+  time timeout ${timeout} kubectl --context=${kube_context} drain ${node} --ignore-daemonsets --force --delete-local-data --pod-selector="${pvc_label_key}!=${pvc_label_val}"
   local rc=$?
   if [[ ${rc} -eq 0 ]]; then
     echo "drained successfully"
@@ -142,6 +160,18 @@ drain_node() {
     echo "kubectl drain exit error: ${rc}"
     delete_pods ${node}
   fi
+}
+
+wait_for_storage_pods_clearance() {
+  local node=$1
+
+  set +e
+  local storage_pod_count=$(retry  kubectl --context=${kube_context} --namespace=${storage_ns} get po --selector="${pvc_label_key}=${pvc_label_val}" -o wide | grep ${node} | wc -l)
+  while [[ ${storage_pod_count} > 0 ]]; do
+    sleep 10
+    echo "waiting for ${pvc_label_key} ${pvc_label_val} pods to migrate away from node: ${node}"
+    storage_pod_count=$(retry  kubectl --context=${kube_context} --namespace=${storage_ns} get po --selector="${pvc_label_key}=${pvc_label_val}" -o wide | grep ${node} | wc -l)
+  done
 }
 
 reboot_node() {
@@ -181,6 +211,7 @@ cycle_nodes() {
     jq -r '.items[].metadata.name')
   for node in ${nodes}; do
     drain_node ${node}
+    wait_for_storage_pods_clearance ${node}
     reboot_node ${node}
     wait_for_ready_node ${node}
   done
@@ -198,6 +229,9 @@ resume() {
     jq -r '.items[].metadata.name')
   for target_node in ${target_nodes}; do
     drain_node ${target_node}
+    wait_for_storage_pods_clearance ${node}
+    reboot_node ${node}
+    wait_for_ready_node ${node}
   done
 
 }
