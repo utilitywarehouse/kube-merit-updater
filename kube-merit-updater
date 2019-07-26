@@ -27,7 +27,7 @@ timeout=600
 
 # Static vars
 storage_ns='sys-longhorn'
-pvc_label_key='type'
+pvc_label_key='tier'
 pvc_label_val='storage'
 
 usage() {
@@ -123,6 +123,12 @@ label_for_cycling() {
   done
 }
 
+delete_retirement_label() {
+  local node=$1
+  echo "removing labelling for retirement: role=${role}"
+  retry kubectl --context=${kube_context} label node ${node} retiring-
+}
+
 label_storage_pods() {
 
   local storage_pods=$(retry kubectl --context=${kube_context} --namespace=${storage_ns} get po | grep pvc | grep -v backup | awk '{print $1}' )
@@ -214,6 +220,7 @@ cycle_nodes() {
     wait_for_storage_pods_clearance ${node}
     reboot_node ${node}
     wait_for_ready_node ${node}
+    delete_retirement_label ${node}
   done
 
 }
@@ -232,6 +239,7 @@ resume() {
     wait_for_storage_pods_clearance ${node}
     reboot_node ${node}
     wait_for_ready_node ${node}
+    delete_retirement_label ${node}
   done
 
 }
