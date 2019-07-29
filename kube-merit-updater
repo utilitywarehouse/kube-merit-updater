@@ -4,14 +4,20 @@
 
 # ## (-)  master and worker steps
 # ## (*)  worker specific steps
-# ## (**) storage-node specific steps
+# ## (**) storage-node steps
 #
 # Assumes a kubernetes cluster with master and workers nodes and separate
 # storage-nodes to schedule pvc related pods.
 #
 # - drain nodes (sequentially)
 # - reboot nodes and wait until they are back and in `Ready` state
-# ** For storage nodes we need to verify that all volumes have enough replicas
+#
+# For storage nodes we follow a different approach.
+# Since all that it is running there are longhorn daemonsets and pvc replica controllers:
+#
+# ** Verify that all volumes have at least 1 replica on other storage-nodes
+# ** reboot nodes and wait until they are back and in `Ready` state
+# ** wait until longhorn mark them as Ready and Schedulable again
 
 set -o errexit
 set -o nounset
@@ -24,11 +30,13 @@ kube_context=''
 role=''
 resume=''
 timeout=600
+socks5_proxy=''
 
 # Static vars
 storage_ns='sys-longhorn'
 pvc_label_key='tier'
 pvc_label_val='storage'
+HTTP_PROXY=''
 
 usage() {
   cat <<EOF
@@ -39,15 +47,17 @@ Usage: $0 -c <kube_context> -s [retire_time_label] -r [role]
         must also be set
   -t    Node drain timeout. How long to wait for the node to drain before
         shutting it down (in seconds, default 300s)
+  -p    Specify a socks5 proxy for kubectl and curl commands <address>:<port>
 EOF
 }
 
-while getopts 'c:r:h:s:t:' flag; do
+while getopts 'c:r:h:s:t:p:' flag; do
   case "${flag}" in
     c) kube_context="${OPTARG}" ;;
     r) role="${OPTARG}" ;;
     s) resume="${OPTARG}" ;;
     t) timeout="${OPTARG}" ;;
+    p) socks5_proxy="${OPTARG}" ;;
     h) usage && exit 0 ;;
     *) echo "Unexpected option: ${flag}" && usage && exit 1 ;;
   esac
@@ -60,6 +70,7 @@ deps="
   kubectl
   ssh
   timeout
+  uniq
   xargs
 "
 
@@ -74,6 +85,14 @@ if [[ -n "${missing_deps}" ]]; then
   echo "Missing dependencies: ${missing_deps}"
   exit 1
 fi
+
+## Set HTTP Proxy env var to proxy kubectl commands
+if [[ -z "${socks5_proxy}" ]]; then
+  echo "No socks proxy set"
+else
+  HTTP_PROXY="socks5://${socks5_proxy}"
+fi
+export HTTP_PROXY=${HTTP_PROXY}
 
 ### Validation
 if [[ -z "${kube_context}" ]]; then
@@ -200,7 +219,7 @@ wait_for_ready_node() {
   set +e
   # Wait for node to report ready again
   local node_status=$(kubectl --context=${kube_context} get node | grep ${node} | awk '{print $2}')
-  until [[ ${node_status} == "Ready,SchedulingDisabled" ]]; do
+  until [[ ${node_status} == "Ready,SchedulingDisabled" || ${node_status} == "Ready" ]]; do
     echo "awaiting node: ${node} to become Ready"
     sleep 10
     node_status=$(kubectl --context=${kube_context} get node | grep ${node} | awk '{print $2}')
@@ -222,6 +241,81 @@ cycle_nodes() {
     wait_for_ready_node ${node}
     delete_retirement_label ${node}
   done
+}
+
+# Checks whether all volumes have replicas that live outside the given node. IF not halts and logs until the condition is met
+check_node_volumes_have_sufficient_replicas() {
+
+  echo "Verifying sufficient replicas before rebooting node ${node}"
+
+  local node=$1
+  local lh_external_ip=$2
+
+  local curl_opts=''
+  if [[ -z "${socks5_proxy}" ]]; then
+    curl_opts="-s"
+  else
+    curl_opts="-s -x socks5://${socks5_proxy}"
+  fi
+
+  local volumes=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/volumes | jq -r .data[].name)
+
+  for volume in ${volumes}; do
+    uniq_replicas=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/volumes/${volume} | jq -r .replicas[].hostId | uniq)
+    while [[ $(echo ${uniq_replicas} | wc -l) == 1 && ${uniq_replicas} == ${node} ]]; do
+      echo "All replicas of: ${volume} are on host ${node}! Sleeping for 15 seconds and retrying.."
+      sleep 15
+      uniq_replicas=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/volumes/${volume} | jq -r .replicas[].hostId | uniq)
+    done;
+  done;
+
+  echo "All volumes have replicas outside ${node}"
+}
+
+wait_for_lh_node_ready() {
+
+  local node=$1
+  local lh_external_ip=$2
+
+  local curl_opts=''
+  if [[ -z "${socks5_proxy}" ]]; then
+    curl_opts="-s"
+  else
+    curl_opts="-s -x socks5://${socks5_proxy}"
+  fi
+
+  local node_ready=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/nodes/${node} | jq -r .conditions.Ready.status)
+  while [[ ${node_ready} != "True" ]]; do
+    echo "Waiting for longhorn to mark node: ${node} as Ready"
+    sleep 15
+    node_ready=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/nodes/${node} | jq -r .conditions.Ready.status)
+  done;
+
+  local node_schedulable=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/nodes/${node} | jq -r .allowScheduling)
+  while [[ ${node_schedulable} != "true" ]]; do
+    echo "Waiting for longhorn to mark node: ${node} as Schedulable"
+    sleep 15
+    node_schedulable=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/nodes/${node} | jq -r .allowScheduling)
+  done;
+
+}
+
+cycle_storage_nodes() {
+
+  local role=$1
+
+  local lh_external_ip=$(retry kubectl --context="${kube_context}" --namespace="${storage_ns}" get svc | grep longhorn-frontend | awk '{print $4}')
+
+  local nodes=$(retry kubectl --context="${kube_context}" get nodes -l role="${role}",retiring="${retire_time}" -o json |\
+    jq -r '.items[].metadata.name')
+
+  for node in ${nodes}; do
+    check_node_volumes_have_sufficient_replicas ${node} ${lh_external_ip}
+    reboot_node ${node}
+    wait_for_ready_node ${node}
+    delete_retirement_label ${node}
+    wait_for_lh_node_ready ${node} ${lh_external_ip}
+  done
 
 }
 
@@ -232,6 +326,8 @@ update() {
 }
 
 resume() {
+  local role=$1
+
   local target_nodes=$(retry kubectl --context="${kube_context}" get nodes -l role="${role}",retiring="${resume}" -o json |\
     jq -r '.items[].metadata.name')
   for target_node in ${target_nodes}; do
@@ -246,11 +342,20 @@ resume() {
 
 echo "kube cluster: ${kube_context}"
 
-if [[ -n "${resume}" ]]; then
-  resume
-  exit 0
+if [[ "${role}" == "master" || "${role}" == "worker" ]]; then
+  if [[ -n "${resume}" ]]; then
+    resume ${role}
+    exit 0
+  fi
+
+  update ${role}
+
+  echo "run: result=\"success\""
 fi
 
-update ${role}
+if  [[ "${role}" == "storage-node" ]]; then
 
-echo "run: result=\"success\""
+  label_for_cycling ${role}
+  cycle_storage_nodes ${role}
+
+fi
