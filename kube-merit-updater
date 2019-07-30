@@ -202,9 +202,10 @@ wait_for_storage_pods_clearance() {
 reboot_node() {
   local node=$1
 
+  set +e
+
   ssh -o ServerAliveInterval=1 -o ServerAliveCountMax=1 -o BatchMode=yes ${node} sudo reboot
 
-  set +e
   local kube_active=$(ssh -oBatchMode=yes ${node} systemctl is-active kubelet.service)
   until [[ ${kube_active} == "active" ]]; do
     echo "awaiting node: ${node} to reboot and kubelet.service to become active"
@@ -261,11 +262,16 @@ check_node_volumes_have_sufficient_replicas() {
   local volumes=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/volumes | jq -r .data[].name)
 
   for volume in ${volumes}; do
-    uniq_replicas=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/volumes/${volume} | jq -r .replicas[].hostId | uniq)
-    while [[ $(echo ${uniq_replicas} | wc -l) == 1 && ${uniq_replicas} == ${node} ]]; do
-      echo "All replicas of: ${volume} are on host ${node}! Sleeping for 15 seconds and retrying.."
+    uniq_replicas=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/volumes/${volume} | jq -r '.replicas[] | select(.running == true and .mode == "RW") | .hostId' | uniq)
+    while [[ $(echo ${uniq_replicas} | wc -l) == 0 ]]; do
+      echo "No running replicas of: ${volume} found.. Please fix manually to continue"
       sleep 15
-      uniq_replicas=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/volumes/${volume} | jq -r .replicas[].hostId | uniq)
+      uniq_replicas=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/volumes/${volume} | jq -r '.replicas[] | select(.running == true and .mode == "RW") | .hostId' | uniq)
+    done;
+    while [[ $(echo ${uniq_replicas} | wc -l) == 1 && ${uniq_replicas} == ${node} ]]; do
+      echo "All running replicas of: ${volume} are on host ${node}! Sleeping for 15 seconds and retrying.."
+      sleep 15
+      uniq_replicas=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/volumes/${volume} | jq -r '.replicas[] | select(.running == true and .mode == "RW") | .hostId' | uniq)
     done;
   done;
 
