@@ -309,10 +309,11 @@ wait_for_lh_node_ready() {
 cycle_storage_nodes() {
 
   local role=$1
+  local ret_time=$2
 
   local lh_external_ip=$(retry kubectl --context="${kube_context}" --namespace="${storage_ns}" get svc | grep longhorn-frontend | awk '{print $4}')
 
-  local nodes=$(retry kubectl --context="${kube_context}" get nodes -l role="${role}",retiring="${retire_time}" -o json |\
+  local nodes=$(retry kubectl --context="${kube_context}" get nodes -l role="${role}",retiring="${ret_time}" -o json |\
     jq -r '.items[].metadata.name')
 
   for node in ${nodes}; do
@@ -355,13 +356,18 @@ if [[ "${role}" == "master" || "${role}" == "worker" ]]; then
   fi
 
   update ${role}
-
-  echo "run: result=\"success\""
 fi
 
 if  [[ "${role}" == "storage-node" ]]; then
 
-  label_for_cycling ${role}
-  cycle_storage_nodes ${role}
+  if [[ -z ${resume} ]]; then
+    label_for_cycling ${role}
+    cycle_storage_nodes ${role} ${retire_time}
+  else
+    cycle_storage_nodes ${role} ${resume}
+  fi
 
 fi
+
+echo "run: result=\"success\""
+
