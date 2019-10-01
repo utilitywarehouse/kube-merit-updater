@@ -150,7 +150,7 @@ delete_retirement_label() {
 
 label_storage_pods() {
 
-  local storage_pods=$(retry kubectl --context=${kube_context} --namespace=${storage_ns} get po | grep pvc | grep -v backup | awk '{print $1}' )
+  local storage_pods=$(retry kubectl --context=${kube_context} --namespace=${storage_ns} get po | grep instance-manager | awk '{print $1}' )
 
   for pod in ${storage_pods}; do
     echo "Labeling pod: ${pod} as ${pvc_label_key}=${pvc_label_val}"
@@ -185,18 +185,6 @@ drain_node() {
     echo "kubectl drain exit error: ${rc}"
     delete_pods ${node}
   fi
-}
-
-wait_for_storage_pods_clearance() {
-  local node=$1
-
-  set +e
-  local storage_pod_count=$(retry  kubectl --context=${kube_context} --namespace=${storage_ns} get po --selector="${pvc_label_key}=${pvc_label_val}" -o wide | grep ${node} | wc -l)
-  while [[ ${storage_pod_count} > 0 ]]; do
-    sleep 10
-    echo "waiting for ${pvc_label_key} ${pvc_label_val} pods to migrate away from node: ${node}"
-    storage_pod_count=$(retry  kubectl --context=${kube_context} --namespace=${storage_ns} get po --selector="${pvc_label_key}=${pvc_label_val}" -o wide | grep ${node} | wc -l)
-  done
 }
 
 reboot_node() {
@@ -237,7 +225,6 @@ cycle_nodes() {
     jq -r '.items[].metadata.name')
   for node in ${nodes}; do
     drain_node ${node}
-    wait_for_storage_pods_clearance ${node}
     reboot_node ${node}
     wait_for_ready_node ${node}
     delete_retirement_label ${node}
@@ -339,7 +326,6 @@ resume() {
     jq -r '.items[].metadata.name')
   for target_node in ${target_nodes}; do
     drain_node ${target_node}
-    wait_for_storage_pods_clearance ${target_node}
     reboot_node ${target_node}
     wait_for_ready_node ${target_node}
     delete_retirement_label ${target_node}
