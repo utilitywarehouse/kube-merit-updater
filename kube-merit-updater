@@ -217,14 +217,47 @@ wait_for_ready_node() {
   retry kubectl --context=${kube_context} uncordon ${node}
 }
 
+check_node_volumes_are_detached() {
+
+  echo "Verifying volumes detached before rebooting node ${node}"
+
+  local node=$1
+  local lh_external_ip=$2
+
+  local curl_opts=''
+  if [[ -z "${socks5_proxy}" ]]; then
+    curl_opts="-s"
+  else
+    curl_opts="-s -x socks5://${socks5_proxy}"
+  fi
+
+  local volumes=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/volumes | jq -r .data[].name)
+
+  for volume in ${volumes}; do
+    controller_node=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/volumes/${volume} | jq -r '.controllers[0].hostId')
+    state=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/volumes/${volume} | jq -r .state)
+    while [[ "${controller_node}" == "${node}" && "${state}" != "detached" ]]; do
+      echo "waiting for volume: ${volume} to detach from node: ${controller_node}"
+      controller_node=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/volumes/${volume} | jq -r '.controllers[0].hostId')
+      state=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/volumes/${volume} | jq -r .state)
+      sleep 1;
+    done;
+  done;
+
+  echo "No volumes attached to ${node}"
+}
+
 cycle_nodes() {
   local role=$1
+
+  local lh_external_ip=$(retry kubectl --context="${kube_context}" --namespace="${storage_ns}" get svc | grep longhorn-frontend | awk '{print $4}')
 
   # - drain and reboot nodes (sequentially)
   local nodes=$(retry kubectl --context="${kube_context}" get nodes -l role="${role}",retiring="${retire_time}" -o json |\
     jq -r '.items[].metadata.name')
   for node in ${nodes}; do
     drain_node ${node}
+    check_node_volumes_are_detached ${node} ${lh_external_ip}
     reboot_node ${node}
     wait_for_ready_node ${node}
     delete_retirement_label ${node}
