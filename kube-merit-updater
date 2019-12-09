@@ -47,7 +47,7 @@ Usage: $0 -c <kube_context> -s [retire_time_label] -r [role]
         must also be set
   -t    Node drain timeout. How long to wait for the node to drain before
         shutting it down (in seconds, default 300s)
-  -p    Specify a socks5 proxy for kubectl and curl commands <address>:<port>
+  -p    Specify a socks5 proxy for kubectl and lhctl commands <address>:<port>
 EOF
 }
 
@@ -68,6 +68,7 @@ deps="
   awk
   jq
   kubectl
+  lhctl
   ssh
   timeout
   uniq
@@ -224,24 +225,12 @@ check_node_volumes_are_detached() {
   local node=$1
   local lh_external_ip=$2
 
-  local curl_opts=''
-  if [[ -z "${socks5_proxy}" ]]; then
-    curl_opts="-s"
-  else
-    curl_opts="-s -x socks5://${socks5_proxy}"
-  fi
+  local volume_count=$(retry lhctl --url=http://${lh_external_ip}/v1 get volume | grep ${node} | wc -l)
 
-  local volumes=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/volumes | jq -r .data[].name)
-
-  for volume in ${volumes}; do
-    controller_node=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/volumes/${volume} | jq -r '.controllers[0].hostId')
-    state=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/volumes/${volume} | jq -r .state)
-    while [[ "${controller_node}" == "${node}" && "${state}" != "detached" ]]; do
-      echo "waiting for volume: ${volume} to detach from node: ${controller_node}"
-      controller_node=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/volumes/${volume} | jq -r '.controllers[0].hostId')
-      state=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/volumes/${volume} | jq -r .state)
-      sleep 1;
-    done;
+  while [[ ${volume_count} -gt 0 ]]; do
+    echo "waiting for volumes (${volume_count}) to detach from node: ${node}"
+    local volume_count=$(retry lhctl --url=http://${lh_external_ip}/v1 get volume | grep ${node} | wc -l)
+    sleep 1;
   done;
 
   echo "No volumes attached to ${node}"
@@ -272,30 +261,31 @@ check_node_volumes_have_sufficient_replicas() {
   local node=$1
   local lh_external_ip=$2
 
-  local curl_opts=''
-  if [[ -z "${socks5_proxy}" ]]; then
-    curl_opts="-s"
-  else
-    curl_opts="-s -x socks5://${socks5_proxy}"
-  fi
-
-  local volumes=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/volumes | jq -r .data[].name)
+  local volumes=$(retry lhctl --url=http://${lh_external_ip}/v1 get volume | tail -n +3 | awk '{print $1}')
 
   for volume in ${volumes}; do
-    uniq_replicas=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/volumes/${volume} | jq -r '.replicas[] | select(.running == true and .mode == "RW") | .hostId' | uniq)
-    while [[ $(echo ${uniq_replicas} | wc -l) == 0 ]]; do
-      echo "No running replicas of: ${volume} found.. Please fix manually to continue"
+    rep_outside_node=$(retry lhctl --url=http://${lh_external_ip}/v1 get replica --volume=${volume} | grep -v ${node} | grep 'RW' | grep 'true' | wc -l)
+    while [[ ${rep_outside_node} -eq 0 ]]; do
+      echo "No running replicas of: ${volume} found outside node ${node}"
       sleep 15
-      uniq_replicas=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/volumes/${volume} | jq -r '.replicas[] | select(.running == true and .mode == "RW") | .hostId' | uniq)
-    done;
-    while [[ $(echo ${uniq_replicas} | wc -l) == 1 && ${uniq_replicas} == ${node} ]]; do
-      echo "All running replicas of: ${volume} are on host ${node}! Sleeping for 15 seconds and retrying.."
-      sleep 15
-      uniq_replicas=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/volumes/${volume} | jq -r '.replicas[] | select(.running == true and .mode == "RW") | .hostId' | uniq)
+      rep_outside_node=$(retry lhctl --url=http://${lh_external_ip}/v1 get replica --volume=${volume} | grep -v ${node} | grep 'RW' | grep 'true' | wc -l) 
     done;
   done;
 
   echo "All volumes have replicas outside ${node}"
+}
+
+drain_storage_node() {
+
+  echo "Draining replicas from node: ${node}"
+
+  local node=$1
+  local lh_external_ip=$2
+
+  replicas=$(retry lhctl --url=http://${lh_external_ip}/v1 get replica | grep ${node} | awk '{print $1}')
+  for replica in ${replicas}; do
+    retry lhctl --url=http://${lh_external_ip}/v1 delete replica ${replica}
+  done
 }
 
 wait_for_lh_node_ready() {
@@ -303,25 +293,18 @@ wait_for_lh_node_ready() {
   local node=$1
   local lh_external_ip=$2
 
-  local curl_opts=''
-  if [[ -z "${socks5_proxy}" ]]; then
-    curl_opts="-s"
-  else
-    curl_opts="-s -x socks5://${socks5_proxy}"
-  fi
-
-  local node_ready=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/nodes/${node} | jq -r .conditions.Ready.status)
+  local node_ready=$(retry lhctl --url=http://${lh_external_ip}/v1 get node | grep ${node} | awk '{print $5}')
   while [[ ${node_ready} != "True" ]]; do
     echo "Waiting for longhorn to mark node: ${node} as Ready"
-    sleep 15
-    node_ready=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/nodes/${node} | jq -r .conditions.Ready.status)
+    sleep 10
+    node_ready=$(retry lhctl --url=http://${lh_external_ip}/v1 get node | grep ${node} | awk '{print $5}')
   done;
 
-  local node_schedulable=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/nodes/${node} | jq -r .allowScheduling)
+  local node_schedulable=$(retry lhctl --url=http://${lh_external_ip}/v1 get node | grep ${node} | awk '{print $3}')
   while [[ ${node_schedulable} != "true" ]]; do
     echo "Waiting for longhorn to mark node: ${node} as Schedulable"
     sleep 15
-    node_schedulable=$(retry curl ${curl_opts} http://${lh_external_ip}/v1/nodes/${node} | jq -r .allowScheduling)
+    node_schedulable=$(retry lhctl --url=http://${lh_external_ip}/v1 get node | grep ${node} | awk '{print $3}')
   done;
 
 }
@@ -338,6 +321,7 @@ cycle_storage_nodes() {
 
   for node in ${nodes}; do
     check_node_volumes_have_sufficient_replicas ${node} ${lh_external_ip}
+    drain_storage_node ${node} ${lh_external_ip}
     reboot_node ${node}
     wait_for_ready_node ${node}
     delete_retirement_label ${node}
