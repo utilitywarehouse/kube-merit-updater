@@ -27,6 +27,7 @@ readonly retire_time=$(date +"%Y-%m-%dT%H-%M-%SZ")
 
 # flags
 kube_context=''
+lh_context=''
 role=''
 resume=''
 timeout=600
@@ -40,7 +41,7 @@ HTTP_PROXY=''
 
 usage() {
   cat <<EOF
-Usage: $0 -c <kube_context> -s [retire_time_label] -r [role]
+Usage: $0 -c <kube_context> -l <longhorn_context> -s [retire_time_label] -r [role]
         -t [timeout]
 
   -s    Resume node rolling. Argument is retire_time label. If set, -r [role]
@@ -51,9 +52,10 @@ Usage: $0 -c <kube_context> -s [retire_time_label] -r [role]
 EOF
 }
 
-while getopts 'c:r:h:s:t:p:' flag; do
+while getopts 'c:l:r:h:s:t:p:' flag; do
   case "${flag}" in
     c) kube_context="${OPTARG}" ;;
+    l) lh_context="${OPTARG}" ;;
     r) role="${OPTARG}" ;;
     s) resume="${OPTARG}" ;;
     t) timeout="${OPTARG}" ;;
@@ -223,13 +225,12 @@ check_node_volumes_are_detached() {
   echo "Verifying volumes detached before rebooting node ${node}"
 
   local node=$1
-  local lh_external_ip=$2
 
-  local volume_count=$(retry lhctl --url=http://${lh_external_ip}/v1 get volume | grep ${node} | wc -l)
+  local volume_count=$(retry lhctl --context=${lh_context} get volume | grep ${node} | wc -l)
 
   while [[ ${volume_count} -gt 0 ]]; do
     echo "waiting for volumes (${volume_count}) to detach from node: ${node}"
-    local volume_count=$(retry lhctl --url=http://${lh_external_ip}/v1 get volume | grep ${node} | wc -l)
+    local volume_count=$(retry lhctl --context=${lh_context} get volume | grep ${node} | wc -l)
     sleep 1;
   done;
 
@@ -239,14 +240,12 @@ check_node_volumes_are_detached() {
 cycle_nodes() {
   local role=$1
 
-  local lh_external_ip=$(retry kubectl --context="${kube_context}" --namespace="${storage_ns}" get svc | grep longhorn-frontend | awk '{print $4}')
-
   # - drain and reboot nodes (sequentially)
   local nodes=$(retry kubectl --context="${kube_context}" get nodes -l role="${role}",retiring="${retire_time}" -o json |\
     jq -r '.items[].metadata.name')
   for node in ${nodes}; do
     drain_node ${node}
-    check_node_volumes_are_detached ${node} ${lh_external_ip}
+    check_node_volumes_are_detached ${node}
     reboot_node ${node}
     wait_for_ready_node ${node}
     delete_retirement_label ${node}
@@ -259,16 +258,15 @@ check_node_volumes_have_sufficient_replicas() {
   echo "Verifying sufficient replicas before rebooting node ${node}"
 
   local node=$1
-  local lh_external_ip=$2
 
-  local volumes=$(retry lhctl --url=http://${lh_external_ip}/v1 get volume | tail -n +3 | awk '{print $1}')
+  local volumes=$(retry lhctl --context=${lh_context} get volume | tail -n +4 | awk '{print $1}')
 
   for volume in ${volumes}; do
-    rep_outside_node=$(retry lhctl --url=http://${lh_external_ip}/v1 get replica --volume=${volume} | grep -v ${node} | grep 'RW' | grep 'true' | wc -l)
+    rep_outside_node=$(retry lhctl --context=${lh_context} get replica --volume=${volume} | grep -v ${node} | grep 'RW' | grep 'true' | wc -l)
     while [[ ${rep_outside_node} -eq 0 ]]; do
       echo "No running replicas of: ${volume} found outside node ${node}"
       sleep 15
-      rep_outside_node=$(retry lhctl --url=http://${lh_external_ip}/v1 get replica --volume=${volume} | grep -v ${node} | grep 'RW' | grep 'true' | wc -l) 
+      rep_outside_node=$(retry lhctl --context=${lh_context} get replica --volume=${volume} | grep -v ${node} | grep 'RW' | grep 'true' | wc -l) 
     done;
   done;
 
@@ -280,31 +278,29 @@ drain_storage_node() {
   echo "Draining replicas from node: ${node}"
 
   local node=$1
-  local lh_external_ip=$2
 
-  replicas=$(retry lhctl --url=http://${lh_external_ip}/v1 get replica | grep ${node} | awk '{print $1}')
+  replicas=$(retry lhctl --context=${lh_context} get replica | grep ${node} | awk '{print $1}')
   for replica in ${replicas}; do
-    retry lhctl --url=http://${lh_external_ip}/v1 delete replica ${replica}
+    retry lhctl --context=${lh_context} delete replica ${replica}
   done
 }
 
 wait_for_lh_node_ready() {
 
   local node=$1
-  local lh_external_ip=$2
 
-  local node_ready=$(retry lhctl --url=http://${lh_external_ip}/v1 get node | grep ${node} | awk '{print $5}')
+  local node_ready=$(retry lhctl --context=${lh_context} get node | grep ${node} | awk '{print $5}')
   while [[ ${node_ready} != "True" ]]; do
     echo "Waiting for longhorn to mark node: ${node} as Ready"
     sleep 10
-    node_ready=$(retry lhctl --url=http://${lh_external_ip}/v1 get node | grep ${node} | awk '{print $5}')
+    node_ready=$(retry lhctl --context=${lh_context} get node | grep ${node} | awk '{print $5}')
   done;
 
-  local node_schedulable=$(retry lhctl --url=http://${lh_external_ip}/v1 get node | grep ${node} | awk '{print $3}')
+  local node_schedulable=$(retry lhctl --context=${lh_context} get node | grep ${node} | awk '{print $3}')
   while [[ ${node_schedulable} != "true" ]]; do
     echo "Waiting for longhorn to mark node: ${node} as Schedulable"
     sleep 15
-    node_schedulable=$(retry lhctl --url=http://${lh_external_ip}/v1 get node | grep ${node} | awk '{print $3}')
+    node_schedulable=$(retry lhctl --context=${lh_context} get node | grep ${node} | awk '{print $3}')
   done;
 
 }
@@ -314,18 +310,16 @@ cycle_storage_nodes() {
   local role=$1
   local ret_time=$2
 
-  local lh_external_ip=$(retry kubectl --context="${kube_context}" --namespace="${storage_ns}" get svc | grep longhorn-frontend | awk '{print $4}')
-
   local nodes=$(retry kubectl --context="${kube_context}" get nodes -l role="${role}",retiring="${ret_time}" -o json |\
     jq -r '.items[].metadata.name')
 
   for node in ${nodes}; do
-    check_node_volumes_have_sufficient_replicas ${node} ${lh_external_ip}
-    drain_storage_node ${node} ${lh_external_ip}
+    check_node_volumes_have_sufficient_replicas ${node}
+    drain_storage_node ${node}
     reboot_node ${node}
     wait_for_ready_node ${node}
     delete_retirement_label ${node}
-    wait_for_lh_node_ready ${node} ${lh_external_ip}
+    wait_for_lh_node_ready ${node}
   done
 
 }
