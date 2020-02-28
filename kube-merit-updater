@@ -97,11 +97,8 @@ else
 fi
 export HTTP_PROXY=${HTTP_PROXY}
 
-## Verify lhctl can reach api
-if ! lhctl --context=${lh_context} get volume > /dev/null; then
-  echo "lhctl can't reach api"
-  exit 1
-fi
+## Verify lhctl doesn't error
+lhctl --context=${lh_context} get volume > /dev/null
 
 ### Validation
 if [[ -z "${kube_context}" ]]; then
