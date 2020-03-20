@@ -255,37 +255,18 @@ cycle_nodes() {
   done
 }
 
-# Checks whether all volumes have replicas that live outside the given node. IF not halts and logs until the condition is met
-check_node_volumes_have_sufficient_replicas() {
-
-  echo "Verifying sufficient replicas before rebooting node ${node}"
-
+drain_storage_node() {
+  echo "Draining replicas from node: ${node}"
   local node=$1
-
-  local volumes=$(retry lhctl --context=${lh_context} get volume | tail -n +4 | awk '{print $1}')
-
-  for volume in ${volumes}; do
-    rep_outside_node=$(retry lhctl --context=${lh_context} get replica --volume=${volume} | grep -v ${node} | grep 'RW' | grep 'true' | wc -l)
-    while [[ ${rep_outside_node} -eq 0 ]]; do
-      echo "No running replicas of: ${volume} found outside node ${node}"
-      sleep 15
-      rep_outside_node=$(retry lhctl --context=${lh_context} get replica --volume=${volume} | grep -v ${node} | grep 'RW' | grep 'true' | wc -l) 
-    done;
-  done;
-
-  echo "All volumes have replicas outside ${node}"
+  # lhctl drain command will only delete replicas of volumes that are in healthy
+  # state (robustness==healthy) otherwise it will loop waiting to meet this
+  # condition
+  retry lhctl --context=${lh_context} drain --node=${node}
 }
 
-drain_storage_node() {
-
-  echo "Draining replicas from node: ${node}"
-
+enable_storage_node() {
   local node=$1
-
-  replicas=$(retry lhctl --context=${lh_context} get replica | grep ${node} | awk '{print $1}')
-  for replica in ${replicas}; do
-    retry lhctl --context=${lh_context} delete replica ${replica}
-  done
+  retry lhctl --context=${lh_context} enable ${node}
 }
 
 wait_for_lh_node_ready() {
@@ -317,10 +298,10 @@ cycle_storage_nodes() {
     jq -r '.items[].metadata.name')
 
   for node in ${nodes}; do
-    check_node_volumes_have_sufficient_replicas ${node}
     drain_storage_node ${node}
     reboot_node ${node}
     wait_for_ready_node ${node}
+    enable_storage_node ${node}
     delete_retirement_label ${node}
     wait_for_lh_node_ready ${node}
   done
