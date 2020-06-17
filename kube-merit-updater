@@ -4,20 +4,11 @@
 
 # ## (-)  master and worker steps
 # ## (*)  worker specific steps
-# ## (**) storage-node steps
 #
-# Assumes a kubernetes cluster with master and workers nodes and separate
-# storage-nodes to schedule pvc related pods.
+# Assumes a kubernetes cluster with master and workers nodes.
 #
 # - drain nodes (sequentially)
 # - reboot nodes and wait until they are back and in `Ready` state
-#
-# For storage nodes we follow a different approach.
-# Since all that it is running there are longhorn daemonsets and pvc replica controllers:
-#
-# ** Verify that all volumes have at least 1 replica on other storage-nodes
-# ** reboot nodes and wait until they are back and in `Ready` state
-# ** wait until longhorn mark them as Ready and Schedulable again
 
 set -o errexit
 set -o nounset
@@ -27,35 +18,30 @@ readonly retire_time=$(date +"%Y-%m-%dT%H-%M-%SZ")
 
 # flags
 kube_context=''
-lh_context=''
 role=''
 resume=''
 timeout=600
 socks5_proxy=''
 
 # Static vars
-storage_ns='sys-longhorn'
-pvc_label_key='tier'
-pvc_label_val='storage'
 HTTP_PROXY=''
 
 usage() {
   cat <<EOF
-Usage: $0 -c <kube_context> -l <longhorn_context> -s [retire_time_label] -r [role]
+Usage: $0 -c <kube_context> -s [retire_time_label] -r [role]
         -t [timeout]
 
   -s    Resume node rolling. Argument is retire_time label. If set, -r [role]
         must also be set
   -t    Node drain timeout. How long to wait for the node to drain before
         shutting it down (in seconds, default 300s)
-  -p    Specify a socks5 proxy for kubectl and lhctl commands <address>:<port>
+  -p    Specify a socks5 proxy for kubectl commands <address>:<port>
 EOF
 }
 
 while getopts 'c:l:r:h:s:t:p:' flag; do
   case "${flag}" in
     c) kube_context="${OPTARG}" ;;
-    l) lh_context="${OPTARG}" ;;
     r) role="${OPTARG}" ;;
     s) resume="${OPTARG}" ;;
     t) timeout="${OPTARG}" ;;
@@ -70,7 +56,6 @@ deps="
   awk
   jq
   kubectl
-  lhctl
   ssh
   timeout
   uniq
@@ -96,9 +81,6 @@ else
   HTTP_PROXY="socks5://${socks5_proxy}"
 fi
 export HTTP_PROXY=${HTTP_PROXY}
-
-## Verify lhctl doesn't error
-lhctl --context=${lh_context} get volume > /dev/null
 
 ### Validation
 if [[ -z "${kube_context}" ]]; then
@@ -154,21 +136,10 @@ delete_retirement_label() {
   retry kubectl --context=${kube_context} label node ${node} retiring-
 }
 
-label_storage_pods() {
-
-  local storage_pods=$(retry kubectl --context=${kube_context} --namespace=${storage_ns} get po | grep instance-manager | awk '{print $1}' )
-
-  for pod in ${storage_pods}; do
-    echo "Labeling pod: ${pod} as ${pvc_label_key}=${pvc_label_val}"
-    retry kubectl --context=${kube_context} --namespace=${storage_ns} label pod ${pod} ${pvc_label_key}=${pvc_label_val} --overwrite
-  done
-  echo "pods labelled"
-}
-
 delete_pods() {
   local node=$1
 
-  retry kubectl --context=${kube_context} get pod --all-namespaces --selector="${pvc_label_key}!=${pvc_label_val}" \
+  retry kubectl --context=${kube_context} get pod --all-namespaces \
     -o jsonpath='{range .items[?(.spec.nodeName=="'${node}'")]}{@.metadata.namespace} {.metadata.name} {end}' |\
     xargs -n2 |\
     xargs -I % sh -c "kubectl --context=${kube_context} delete pods -n=%"
@@ -177,10 +148,8 @@ delete_pods() {
 drain_node() {
   local node=$1
 
-  label_storage_pods # Label storage pods right before draining to catch any new storage pod creation
-
   set +e
-  time timeout ${timeout} kubectl --context=${kube_context} drain ${node} --ignore-daemonsets --force --delete-local-data --pod-selector="${pvc_label_key}!=${pvc_label_val}"
+  time timeout ${timeout} kubectl --context=${kube_context} drain ${node} --ignore-daemonsets --force --delete-local-data
   local rc=$?
   if [[ ${rc} -eq 0 ]]; then
     echo "drained successfully"
@@ -223,23 +192,6 @@ wait_for_ready_node() {
   retry kubectl --context=${kube_context} uncordon ${node}
 }
 
-check_node_volumes_are_detached() {
-
-  echo "Verifying volumes detached before rebooting node ${node}"
-
-  local node=$1
-
-  local volume_count=$(retry lhctl --context=${lh_context} get volume | grep ${node} | wc -l)
-
-  while [[ ${volume_count} -gt 0 ]]; do
-    echo "waiting for volumes (${volume_count}) to detach from node: ${node}"
-    local volume_count=$(retry lhctl --context=${lh_context} get volume | grep ${node} | wc -l)
-    sleep 1;
-  done;
-
-  echo "No volumes attached to ${node}"
-}
-
 cycle_nodes() {
   local role=$1
 
@@ -248,64 +200,10 @@ cycle_nodes() {
     jq -r '.items[].metadata.name')
   for node in ${nodes}; do
     drain_node ${node}
-    check_node_volumes_are_detached ${node}
     reboot_node ${node}
     wait_for_ready_node ${node}
     delete_retirement_label ${node}
   done
-}
-
-drain_storage_node() {
-  echo "Draining replicas from node: ${node}"
-  local node=$1
-  # lhctl drain command will only delete replicas of volumes that are in healthy
-  # state (robustness==healthy) otherwise it will loop waiting to meet this
-  # condition
-  retry lhctl --context=${lh_context} drain --node=${node}
-}
-
-enable_storage_node() {
-  local node=$1
-  retry lhctl --context=${lh_context} enable ${node}
-}
-
-wait_for_lh_node_ready() {
-
-  local node=$1
-
-  local node_ready=$(retry lhctl --context=${lh_context} get node | grep ${node} | awk '{print $5}')
-  while [[ ${node_ready} != "True" ]]; do
-    echo "Waiting for longhorn to mark node: ${node} as Ready"
-    sleep 10
-    node_ready=$(retry lhctl --context=${lh_context} get node | grep ${node} | awk '{print $5}')
-  done;
-
-  local node_schedulable=$(retry lhctl --context=${lh_context} get node | grep ${node} | awk '{print $3}')
-  while [[ ${node_schedulable} != "true" ]]; do
-    echo "Waiting for longhorn to mark node: ${node} as Schedulable"
-    sleep 15
-    node_schedulable=$(retry lhctl --context=${lh_context} get node | grep ${node} | awk '{print $3}')
-  done;
-
-}
-
-cycle_storage_nodes() {
-
-  local role=$1
-  local ret_time=$2
-
-  local nodes=$(retry kubectl --context="${kube_context}" get nodes -l role="${role}",retiring="${ret_time}" -o json |\
-    jq -r '.items[].metadata.name')
-
-  for node in ${nodes}; do
-    drain_storage_node ${node}
-    reboot_node ${node}
-    wait_for_ready_node ${node}
-    enable_storage_node ${node}
-    delete_retirement_label ${node}
-    wait_for_lh_node_ready ${node}
-  done
-
 }
 
 update() {
@@ -330,25 +228,12 @@ resume() {
 
 echo "kube cluster: ${kube_context}"
 
-if [[ "${role}" == "master" || "${role}" == "worker" ]]; then
-  if [[ -n "${resume}" ]]; then
-    resume ${role}
-    exit 0
-  fi
-
-  update ${role}
+if [[ -n "${resume}" ]]; then
+  resume ${role}
+  exit 0
 fi
 
-if  [[ "${role}" == "storage-node" ]]; then
-
-  if [[ -z ${resume} ]]; then
-    label_for_cycling ${role}
-    cycle_storage_nodes ${role} ${retire_time}
-  else
-    cycle_storage_nodes ${role} ${resume}
-  fi
-
-fi
+update ${role}
 
 echo "run: result=\"success\""
 
