@@ -162,11 +162,12 @@ drain_node() {
   fi
 }
 
-drain_volumeattachments() {
+wait_until_volumeattachments_drained() {
   local node=$1
 
-  for va in $(retry kubectl --context="${kube_context}" get volumeattachment | grep ${node} | awk '{print $1}'); do
-    retry kubectl --context="${kube_context}" delete volumeattachment ${va}
+  until [[ $(kubectl --context="${kube_context}" get volumeattachment | grep ${node} | wc -l) == 0 ]]; do
+    echo "Waiting for kubelet to detach all volumes from node: ${node}..."
+    sleep 1
   done
 }
 
@@ -208,7 +209,7 @@ cycle_nodes() {
     jq -r '.items[].metadata.name')
   for node in ${nodes}; do
     drain_node ${node}
-    drain_volumeattachments ${node}
+    wait_until_volumeattachments_drained ${node}
     reboot_node ${node}
     wait_for_ready_node ${node}
     delete_retirement_label ${node}
@@ -228,7 +229,7 @@ resume() {
     jq -r '.items[].metadata.name')
   for target_node in ${target_nodes}; do
     drain_node ${target_node}
-    drain_volumeattachments ${target_node}
+    wait_until_volumeattachments_drained ${target_node}
     reboot_node ${target_node}
     wait_for_ready_node ${target_node}
     delete_retirement_label ${target_node}
