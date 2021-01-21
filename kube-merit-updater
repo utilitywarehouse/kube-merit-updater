@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Shell style guide: https://google.github.io/styleguide/shell.xml
 
@@ -7,7 +7,8 @@
 #
 # Assumes a kubernetes cluster with master and workers nodes.
 #
-# - drain nodes (sequentially)
+# Performs the following actions concurrently, up to $max_nodes at a time:
+# - drain nodes
 # - reboot nodes and wait until they are back and in `Ready` state
 
 set -o errexit
@@ -20,8 +21,9 @@ readonly retire_time=$(date +"%Y-%m-%dT%H-%M-%SZ")
 kube_context=''
 role=''
 resume=''
-timeout=600
+timeout=''
 socks5_proxy=''
+max_nodes=3
 
 # Static vars
 HTTP_PROXY=''
@@ -29,23 +31,25 @@ HTTP_PROXY=''
 usage() {
   cat <<EOF
 Usage: $0 -c <kube_context> -s [retire_time_label] -r [role]
-        -t [timeout]
+        -t [timeout] -n [max_nodes]
 
   -s    Resume node rolling. Argument is retire_time label. If set, -r [role]
         must also be set
   -t    Node drain timeout. How long to wait for the node to drain before
-        shutting it down (in seconds, default 300s)
+        shutting it down (in seconds, default 600s*max_nodes)
   -p    Specify a socks5 proxy for kubectl commands <address>:<port>
+  -n    The maximum number of nodes that are permitted to be rolled at once (default 3)
 EOF
 }
 
-while getopts 'c:r:h:s:t:p:' flag; do
+while getopts 'c:r:h:s:t:p:n:' flag; do
   case "${flag}" in
     c) kube_context="${OPTARG}" ;;
     r) role="${OPTARG}" ;;
     s) resume="${OPTARG}" ;;
     t) timeout="${OPTARG}" ;;
     p) socks5_proxy="${OPTARG}" ;;
+    n) max_nodes="${OPTARG}" ;;
     h) usage && exit 0 ;;
     *) echo "Unexpected option: ${flag}" && usage && exit 1 ;;
   esac
@@ -82,8 +86,21 @@ else
 fi
 export HTTP_PROXY=${HTTP_PROXY}
 
+# If a timeout isn't set then default to 10m * the max number of nodes that may
+# be draining concurrently. This affords the same timeout to pods covered by the
+# same PDB.
+if [[ -z "${timeout}" ]]; then
+  timeout=$((600*max_nodes))
+fi
+
 ### Validation
 if [[ -z "${kube_context}" ]]; then
+  usage
+  exit 1
+fi
+
+if [[ "${max_nodes}" -lt 1 ]]; then
+  echo "Max nodes must be >=1: ${max_nodes}"
   usage
   exit 1
 fi
@@ -149,7 +166,7 @@ drain_node() {
   local node=$1
 
   set +e
-  time timeout ${timeout} kubectl --context=${kube_context} drain ${node} --ignore-daemonsets --force --delete-local-data
+  time timeout --foreground ${timeout} kubectl --context=${kube_context} drain ${node} --ignore-daemonsets --force --delete-local-data
   local rc=$?
   if [[ ${rc} -eq 0 ]]; then
     echo "drained successfully"
@@ -201,41 +218,46 @@ wait_for_ready_node() {
   retry kubectl --context=${kube_context} uncordon ${node}
 }
 
-cycle_nodes() {
-  local role=$1
+cycle_node() {
+    local node=$1
 
-  # - drain and reboot nodes (sequentially)
-  local nodes=$(retry kubectl --context="${kube_context}" get nodes -l role="${role}",retiring="${retire_time}" -o json |\
-    jq -r '.items[].metadata.name')
-  for node in ${nodes}; do
     drain_node ${node}
     wait_until_volumeattachments_drained ${node}
     reboot_node ${node}
     wait_for_ready_node ${node}
     delete_retirement_label ${node}
+}
+
+cycle_nodes() {
+  local role=$1
+  local retiring=$2
+
+  nodes=$(retry kubectl --context="${kube_context}" get nodes -l role="${role}",retiring="${retiring}" -o json |\
+    jq -r '.items[].metadata.name')
+  for node in ${nodes}; do
+    while [[ $(jobs -p | wc -l) -ge $max_nodes ]]; do
+      wait -n
+    done
+    cycle_node ${node} &
   done
+  wait
 }
 
 update() {
   local role=$1
+
   label_for_cycling ${role}
-  cycle_nodes ${role}
+  cycle_nodes ${role} ${retire_time}
 }
 
 resume() {
   local role=$1
 
-  local target_nodes=$(retry kubectl --context="${kube_context}" get nodes -l role="${role}",retiring="${resume}" -o json |\
-    jq -r '.items[].metadata.name')
-  for target_node in ${target_nodes}; do
-    drain_node ${target_node}
-    wait_until_volumeattachments_drained ${target_node}
-    reboot_node ${target_node}
-    wait_for_ready_node ${target_node}
-    delete_retirement_label ${target_node}
-  done
-
+  cycle_nodes ${role} ${resume}
 }
+
+# Cleanup child processes on exit
+trap "kill 0" EXIT
 
 echo "kube cluster: ${kube_context}"
 
