@@ -31,7 +31,7 @@ HTTP_PROXY=''
 usage() {
   cat <<EOF
 Usage: $0 -c <kube_context> -s [retire_time_label] -r [role]
-        -t [timeout] -n [max_nodes]
+        -t [timeout] -p [socks5_proxy] -n [max_nodes]
 
   -s    Resume node rolling. Argument is retire_time label. If set, -r [role]
         must also be set
