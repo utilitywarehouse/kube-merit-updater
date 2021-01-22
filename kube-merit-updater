@@ -68,7 +68,7 @@ deps="
 
 missing_deps=""
 for d in ${deps}; do
-  if ! command -v ${d} &> /dev/null; then
+  if ! command -v "${d}" &> /dev/null; then
     missing_deps+="${d} "
   fi
 done
@@ -112,7 +112,7 @@ if [[ -z "${role}" ]] ; then
 fi
 
 function fail() {
-  echo $1 >&2
+  echo "$1" >&2
   exit 1
 }
 
@@ -121,7 +121,9 @@ function retry() {
   local max=12
   local delay=8
   while true; do
-    "$@" && break || {
+    if "$@"; then
+      break
+    else
       if [[ $n -lt $max ]]; then
         ((n++))
         echo "command failed: attempt=$n max=$max"
@@ -129,7 +131,7 @@ function retry() {
       else
         fail "the command has failed after $n attempts."
       fi
-    }
+    fi
   done
 }
 
@@ -137,27 +139,27 @@ label_for_cycling() {
   local role=$1
   local nodes=""
   while [[ -z "${nodes}" ]]; do
-    nodes=$(retry kubectl --context=${kube_context} get nodes -l role=${role} -o json | jq -r '.items[].metadata.name')
+    nodes=$(retry kubectl --context="${kube_context}" get nodes -l role="${role}" -o json | jq -r '.items[].metadata.name')
   done
 
   echo "${kube_context}: nodes=$(echo "${nodes}" | wc -l) role=${role}"
   echo "labelling for retirement: role=${role}"
   for node in ${nodes}; do
-    retry kubectl --context=${kube_context} label node ${node} retiring=${retire_time} --overwrite=true
+    retry kubectl --context="${kube_context}" label node "${node}" retiring="${retire_time}" --overwrite=true
   done
 }
 
 delete_retirement_label() {
   local node=$1
   echo "removing labelling for retirement: role=${role}"
-  retry kubectl --context=${kube_context} label node ${node} retiring-
+  retry kubectl --context="${kube_context}" label node "${node}" retiring-
 }
 
 delete_pods() {
   local node=$1
 
-  retry kubectl --context=${kube_context} get pod --all-namespaces \
-    -o jsonpath='{range .items[?(.spec.nodeName=="'${node}'")]}{@.metadata.namespace} {.metadata.name} {end}' |\
+  retry kubectl --context="${kube_context}" get pod --all-namespaces \
+    -o jsonpath="{range .items[?(.spec.nodeName==\"${node}\")]}{@.metadata.namespace} {.metadata.name} {end}" |\
     xargs -n2 |\
     xargs -I % sh -c "kubectl --context=${kube_context} delete pods -n=%"
 }
@@ -166,23 +168,23 @@ drain_node() {
   local node=$1
 
   set +e
-  time timeout --foreground ${timeout} kubectl --context=${kube_context} drain ${node} --ignore-daemonsets --force --delete-local-data
+  time timeout --foreground ${timeout} kubectl --context="${kube_context}" drain "${node}" --ignore-daemonsets --force --delete-local-data
   local rc=$?
   if [[ ${rc} -eq 0 ]]; then
     echo "drained successfully"
   elif [[ ${rc} -eq 124 ]]; then
     echo "timeout reached, continuing: timeout=${timeout}"
-    delete_pods ${node}
+    delete_pods "${node}"
   else
     echo "kubectl drain exit error: ${rc}"
-    delete_pods ${node}
+    delete_pods "${node}"
   fi
 }
 
 wait_until_volumeattachments_drained() {
   local node=$1
 
-  until [[ $(kubectl --context="${kube_context}" get volumeattachment | grep ${node} | wc -l) == 0 ]]; do
+  until [[ $(kubectl --context="${kube_context}" get volumeattachment | grep -c "${node}") == 0 ]]; do
     echo "Waiting for kubelet to detach all volumes from node: ${node}..."
     sleep 1
   done
@@ -193,13 +195,14 @@ reboot_node() {
 
   set +e
 
-  ssh -o ServerAliveInterval=1 -o ServerAliveCountMax=1 -o BatchMode=yes ${node} sudo reboot
+  ssh -o ServerAliveInterval=1 -o ServerAliveCountMax=1 -o BatchMode=yes "${node}" sudo reboot
 
-  local kube_active=$(ssh -oBatchMode=yes ${node} systemctl is-active kubelet.service)
+  local kube_active
+  kube_active=$(ssh -oBatchMode=yes "${node}" systemctl is-active kubelet.service)
   until [[ ${kube_active} == "active" ]]; do
     echo "awaiting node: ${node} to reboot and kubelet.service to become active"
     sleep 15
-    kube_active=$(ssh -oBatchMode=yes ${node} systemctl is-active kubelet.service)
+    kube_active=$(ssh -oBatchMode=yes "${node}" systemctl is-active kubelet.service)
   done
 }
 
@@ -208,24 +211,25 @@ wait_for_ready_node() {
 
   set +e
   # Wait for node to report ready again
-  local node_status=$(kubectl --context=${kube_context} get node | grep ${node} | awk '{print $2}')
+  local node_status
+  node_status=$(kubectl --context="${kube_context}" get node | grep "${node}" | awk '{print $2}')
   until [[ ${node_status} == "Ready,SchedulingDisabled" || ${node_status} == "Ready" ]]; do
     echo "awaiting node: ${node} to become Ready"
     sleep 10
-    node_status=$(kubectl --context=${kube_context} get node | grep ${node} | awk '{print $2}')
+    node_status=$(kubectl --context="${kube_context}" get node | grep "${node}" | awk '{print $2}')
   done
   # Uncordon the node
-  retry kubectl --context=${kube_context} uncordon ${node}
+  retry kubectl --context="${kube_context}" uncordon "${node}"
 }
 
 cycle_node() {
     local node=$1
 
-    drain_node ${node}
-    wait_until_volumeattachments_drained ${node}
-    reboot_node ${node}
-    wait_for_ready_node ${node}
-    delete_retirement_label ${node}
+    drain_node "${node}"
+    wait_until_volumeattachments_drained "${node}"
+    reboot_node "${node}"
+    wait_for_ready_node "${node}"
+    delete_retirement_label "${node}"
 }
 
 cycle_nodes() {
@@ -238,7 +242,7 @@ cycle_nodes() {
     while [[ $(jobs -p | wc -l) -ge $max_nodes ]]; do
       wait -n
     done
-    cycle_node ${node} &
+    cycle_node "${node}" &
   done
   wait
 }
@@ -246,14 +250,14 @@ cycle_nodes() {
 update() {
   local role=$1
 
-  label_for_cycling ${role}
-  cycle_nodes ${role} ${retire_time}
+  label_for_cycling "${role}"
+  cycle_nodes "${role}" "${retire_time}"
 }
 
 resume() {
   local role=$1
 
-  cycle_nodes ${role} ${resume}
+  cycle_nodes "${role}" "${resume}"
 }
 
 # Cleanup child processes on exit
@@ -262,11 +266,11 @@ trap "kill 0" EXIT
 echo "kube cluster: ${kube_context}"
 
 if [[ -n "${resume}" ]]; then
-  resume ${role}
+  resume "${role}"
   exit 0
 fi
 
-update ${role}
+update "${role}"
 
 echo "run: result=\"success\""
 
