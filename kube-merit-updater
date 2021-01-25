@@ -242,9 +242,21 @@ cycle_nodes() {
     while [[ $(jobs -p | wc -l) -ge $max_nodes ]]; do
       wait -n
     done
-    cycle_node "${node}" &
+    # Run cycle_node in a background job. Redirect stdout and stderr through
+    # 'logger' which adds a timestamp and the node name to each line of output.
+    cycle_node "${node}" > >(logger "${node}") 2> >(logger "${node}" >&2) &
   done
   wait
+}
+
+log() {
+  echo -e "${*}" | logger >&2
+}
+
+logger() {
+    while read -r line; do
+      printf "%(%Y-%m-%dT%H:%M:%S)T [${1:-main}] %s\n" '-1' "${line}"
+    done
 }
 
 update() {
@@ -263,7 +275,7 @@ resume() {
 # Cleanup child processes on exit
 trap "kill 0" EXIT
 
-echo "kube cluster: ${kube_context}"
+log "kube cluster: ${kube_context}"
 
 if [[ -n "${resume}" ]]; then
   resume "${role}"
@@ -272,5 +284,5 @@ fi
 
 update "${role}"
 
-echo "run: result=\"success\""
+log "run: result=\"success\""
 
