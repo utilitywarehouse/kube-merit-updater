@@ -56,6 +56,11 @@ while getopts 'hc:r:s:t:p:n:' flag; do
 done
 
 ### Deps
+if [[ "${BASH_VERSINFO:-0}" -lt 4 ]]; then
+    echo "Bash version must be >=4"
+    exit 1
+fi
+
 deps="
   awk
   jq
