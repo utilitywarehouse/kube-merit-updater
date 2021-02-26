@@ -173,7 +173,7 @@ drain_node() {
   local node=$1
 
   set +e
-  time timeout --foreground ${timeout} kubectl --context="${kube_context}" drain "${node}" --ignore-daemonsets --force --delete-local-data
+  time timeout --foreground ${timeout} kubectl --context="${kube_context}" drain "${node}" --ignore-daemonsets --force --delete-emptydir-data
   local rc=$?
   if [[ ${rc} -eq 0 ]]; then
     echo "drained successfully"
