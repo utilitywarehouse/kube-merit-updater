@@ -163,10 +163,10 @@ delete_retirement_label() {
 delete_pods() {
   local node=$1
 
-  retry kubectl --context="${kube_context}" get pod --all-namespaces \
-    -o jsonpath="{range .items[?(.spec.nodeName==\"${node}\")]}{@.metadata.namespace} {.metadata.name} {end}" |\
-    xargs -n2 |\
-    xargs -I % sh -c "kubectl --context=${kube_context} delete pods -n=%"
+  retry timeout 60 kubectl --context="${kube_context}" get pod --all-namespaces \
+    -o jsonpath="{range .items[?(.spec.nodeName==\"${node}\")]}{@.metadata.namespace} {.metadata.name} {end}" \
+      | xargs -n2 \
+      | xargs -I % sh -c "kubectl --context=${kube_context} delete pods -n=%"
 }
 
 drain_node() {
