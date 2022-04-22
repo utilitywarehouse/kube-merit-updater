@@ -22,6 +22,7 @@ kube_context=''
 role=''
 resume=''
 timeout=''
+promtail_cfg=''
 socks5_proxy=''
 max_nodes=1
 
@@ -37,17 +38,19 @@ Usage: $0 -c <kube_context> -s [retire_time_label] -r [role]
         must also be set
   -t    Node drain timeout. How long to wait for the node to drain before
         shutting it down (in seconds, default 600s*max_nodes)
+  -l    Path to promtail config (when set stdout will be streamed to loki by proxy of a log file)
   -p    Specify a socks5 proxy for kubectl commands <address>:<port>
   -n    The maximum number of nodes that are permitted to be rolled at once (default 1)
 EOF
 }
 
-while getopts 'hc:r:s:t:p:n:' flag; do
+while getopts 'hc:r:s:t:p:n:l:' flag; do
   case "${flag}" in
     c) kube_context="${OPTARG}" ;;
     r) role="${OPTARG}" ;;
     s) resume="${OPTARG}" ;;
     t) timeout="${OPTARG}" ;;
+    l) promtail_cfg="${OPTARG}" ;;
     p) socks5_proxy="${OPTARG}" ;;
     n) max_nodes="${OPTARG}" ;;
     h) usage && exit 0 ;;
@@ -115,6 +118,19 @@ if [[ -z "${role}" ]] ; then
   usage
   exit 1
 fi
+
+if [[ -n "${promtail_cfg}" ]]; then
+  if ! command -v promtail &> /dev/null; then
+    echo "Promtail not installed"
+    exit 1
+  fi
+
+  promtail --config.file="${promtail_cfg}" &
+  touch kube-updater.log
+  sleep 2 # give promtail time to start
+  exec &> >(tee kube-updater.log)
+fi
+
 
 function fail() {
   echo "$1" >&2
