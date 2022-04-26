@@ -132,6 +132,8 @@ if [[ -n "${promtail_cfg}" ]]; then
   exec &> >(tee "${LOG_FILE}") # redirect execution through tee
 fi
 
+# Cleanup child processes on exit
+trap "kill 0" EXIT
 
 function fail() {
   echo "$1" >&2
@@ -261,14 +263,17 @@ cycle_nodes() {
   nodes=$(retry kubectl --context="${kube_context}" get nodes -l role="${role}",retiring="${retiring}" -o json |\
     jq -r '.items[].metadata.name')
   for node in ${nodes}; do
-    while [[ $(jobs -p | wc -l) -ge $max_nodes ]]; do
+    while [[ $(jobs | grep -v promtail | wc -l) -ge $max_nodes ]]; do
       wait -n
     done
     # Run cycle_node in a background job. Redirect stdout and stderr through
     # 'logger' which adds a timestamp and the node name to each line of output.
     cycle_node "${node}" > >(logger "${node}") 2> >(logger "${node}" >&2) &
   done
-  wait
+
+  while [[ $(jobs | grep -v promtail | wc -l) -gt 0 ]]; do
+    wait -n
+  done
 }
 
 log() {
@@ -293,9 +298,6 @@ resume() {
 
   cycle_nodes "${role}" "${resume}"
 }
-
-# Cleanup child processes on exit
-trap "kill 0" EXIT
 
 log "kube cluster: ${kube_context}"
 
