@@ -126,7 +126,7 @@ if [[ -n "${promtail_cfg}" ]]; then
     exit 1
   fi
 
-  promtail --config.file="${promtail_cfg}" &
+  promtail --config.file="${promtail_cfg}" --client.external-labels=kube-context="${kube_context}" &
   touch "${LOG_FILE}"
   sleep 2 # give promtail time to start
   exec &> >(tee "${LOG_FILE}") # redirect execution through tee
